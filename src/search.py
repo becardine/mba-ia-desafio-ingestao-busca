@@ -1,3 +1,14 @@
+import os
+
+from dotenv import load_dotenv
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_postgres import PGVector
+
+load_dotenv()
+
 PROMPT_TEMPLATE = """
 CONTEXTO:
 {contexto}
@@ -25,5 +36,55 @@ PERGUNTA DO USUÁRIO:
 RESPONDA A "PERGUNTA DO USUÁRIO"
 """
 
+REQUIRED_ENV_VARS = (
+    "OPENAI_API_KEY",
+    "OPENAI_EMBEDDING_MODEL",
+    "OPENAI_CHAT_MODEL",
+    "DATABASE_URL",
+    "PG_VECTOR_COLLECTION_NAME",
+)
+
+
+def get_vector_store():
+    return PGVector(
+        embeddings=OpenAIEmbeddings(model=os.getenv("OPENAI_EMBEDDING_MODEL")),
+        collection_name=os.getenv("PG_VECTOR_COLLECTION_NAME"),
+        connection=os.getenv("DATABASE_URL"),
+        use_jsonb=True,
+    )
+
+
 def search_prompt(question=None):
-    pass
+    missing = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
+    if missing:
+        print(f"Variáveis de ambiente ausentes: {', '.join(missing)}")
+        return None
+
+    try:
+        store = get_vector_store()
+        llm = ChatOpenAI(model=os.getenv("OPENAI_CHAT_MODEL"))
+    except Exception as e:
+        print(f"Erro ao inicializar a busca: {e}")
+        return None
+
+    def retrieve_context(pergunta):
+        # Vetoriza a pergunta e traz os 10 chunks mais próximos.
+        results = store.similarity_search_with_score(pergunta, k=10)
+        return "\n\n".join(doc.page_content.strip() for doc, _score in results)
+
+    prompt = PromptTemplate.from_template(PROMPT_TEMPLATE)
+
+    chain = (
+        {
+            "contexto": RunnableLambda(retrieve_context),
+            "pergunta": RunnablePassthrough(),
+        }
+        | prompt
+        | llm
+        | StrOutputParser()
+    )
+
+    if question is not None:
+        return chain.invoke(question)
+
+    return chain
